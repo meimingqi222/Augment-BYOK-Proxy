@@ -158,11 +158,11 @@ impl HistorySummaryCache {
   }
 }
 
-fn approx_token_count_from_byte_len(len: usize) -> u32 {
-  const BYTES_PER_TOKEN: usize = 4;
-  let tokens = len
-    .saturating_add(BYTES_PER_TOKEN.saturating_sub(1))
-    .saturating_div(BYTES_PER_TOKEN);
+fn approx_token_count_from_byte_len(len: usize, bytes_per_token: f32) -> u32 {
+  if bytes_per_token <= 0.0 {
+    return u32::MAX;
+  }
+  let tokens = (len as f32 / bytes_per_token).ceil() as u64;
   u32::try_from(tokens).unwrap_or(u32::MAX)
 }
 
@@ -1171,7 +1171,7 @@ pub async fn maybe_summarize_and_compact(
     }
     "ratio" => match cw_tokens_raw {
       Some(context_window_tokens) => {
-        let approx_total_tokens = approx_token_count_from_byte_len(total_with_extra);
+        let approx_total_tokens = approx_token_count_from_byte_len(total_with_extra, hs.bytes_per_token_estimate);
         let approx_ratio = if context_window_tokens == 0 {
           1.0
         } else {
@@ -1184,13 +1184,13 @@ pub async fn maybe_summarize_and_compact(
             ((context_window_tokens as f64) * (hs.trigger_on_context_ratio as f64)).ceil() as u64;
           let threshold_chars = u64::try_from(threshold_tokens)
             .unwrap_or(u64::MAX)
-            .saturating_mul(4) as usize;
+            .saturating_mul(hs.bytes_per_token_estimate as u64) as usize;
 
           let target_tokens =
             ((context_window_tokens as f64) * (hs.target_context_ratio as f64)).floor() as u64;
           let target_chars_budget = u64::try_from(target_tokens)
             .unwrap_or(u64::MAX)
-            .saturating_mul(4) as usize;
+            .saturating_mul(hs.bytes_per_token_estimate as u64) as usize;
           let summary_overhead = hs
             .abridged_history_params
             .total_chars_limit
@@ -1219,15 +1219,16 @@ pub async fn maybe_summarize_and_compact(
     },
     "auto" | _ => {
       if let Some(context_window_tokens_raw) = cw_tokens_raw {
-        let cap_tokens =
-          u32::try_from(hs.trigger_on_history_size_chars.saturating_div(4)).unwrap_or(u32::MAX);
+        let cap_tokens = u32::try_from(
+          (hs.trigger_on_history_size_chars as f32 / hs.bytes_per_token_estimate) as u64
+        ).unwrap_or(u32::MAX);
         let context_window_tokens = if cap_tokens > 0 {
           context_window_tokens_raw.min(cap_tokens)
         } else {
           context_window_tokens_raw
         };
 
-        let approx_total_tokens = approx_token_count_from_byte_len(total_with_extra);
+        let approx_total_tokens = approx_token_count_from_byte_len(total_with_extra, hs.bytes_per_token_estimate);
         let approx_ratio = if context_window_tokens == 0 {
           1.0
         } else {
@@ -1240,17 +1241,17 @@ pub async fn maybe_summarize_and_compact(
             ((context_window_tokens as f64) * (hs.trigger_on_context_ratio as f64)).ceil() as u64;
           let threshold_chars = u64::try_from(threshold_tokens)
             .unwrap_or(u64::MAX)
-            .saturating_mul(4) as usize;
+            .saturating_mul(hs.bytes_per_token_estimate as u64) as usize;
 
           let target_tokens =
             ((context_window_tokens as f64) * (hs.target_context_ratio as f64)).floor() as u64;
           let target_chars_budget = u64::try_from(target_tokens)
             .unwrap_or(u64::MAX)
-            .saturating_mul(4) as usize;
+            .saturating_mul(hs.bytes_per_token_estimate as u64) as usize;
           let summary_overhead = hs
             .abridged_history_params
             .total_chars_limit
-            .saturating_add((hs.max_tokens as usize).saturating_mul(4))
+            .saturating_add((hs.max_tokens as usize).saturating_mul(hs.bytes_per_token_estimate as usize))
             .saturating_add(4096);
           let target_tail_budget_chars = target_chars_budget.saturating_sub(summary_overhead);
 
@@ -1366,6 +1367,7 @@ pub async fn maybe_summarize_and_compact(
       let mut used_rolling = false;
       let mut prompt = hs.prompt.clone();
       let mut input_history = dropped_head.clone();
+      let mut use_fallback_full_summary = false;
 
       if hs.rolling_summary {
         if let Some(prev) = cache
@@ -1379,48 +1381,97 @@ pub async fn maybe_summarize_and_compact(
               .iter()
               .position(|h| h.request_id == prev.summarized_until_request_id);
             if let Some(pos) = prev_boundary_pos.filter(|p| *p < tail_start) {
-              let mut delta = augment.chat_history[pos..tail_start].to_vec();
-              if !delta.is_empty() {
-                let prev_exchange = AugmentChatHistory {
-                  response_text: String::new(),
-                  request_message: format!(
-                    "[PREVIOUS_SUMMARY]\n{}\n[/PREVIOUS_SUMMARY]",
-                    prev.summary_text.trim()
-                  ),
-                  request_id: "proxy_history_summary_prev".to_string(),
-                  request_nodes: Vec::new(),
-                  structured_request_nodes: Vec::new(),
-                  nodes: Vec::new(),
-                  response_nodes: Vec::new(),
-                  structured_output_nodes: Vec::new(),
-                };
-                let mut merged = Vec::with_capacity(1 + delta.len());
-                merged.push(prev_exchange);
-                merged.append(&mut delta);
-                input_history = merged;
-                used_rolling = true;
-                prompt = format!(
-                  "{}\n\nYou will be given an existing summary and additional new conversation turns. Update the summary to include the new information. Output only the updated summary.",
-                  hs.prompt.trim()
-                );
+              let delta = augment.chat_history[pos..tail_start].to_vec();
+              let delta_size = estimate_history_size_chars(&delta);
+              let head_size = estimate_history_size_chars(&dropped_head);
+
+              // 策略1：如果 head 足够小，优先使用全量摘要（避免滚动丢失信息）
+              let max_input_for_full = (hs.max_summarization_input_chars as f32 * 0.6) as usize;
+              if head_size <= max_input_for_full {
                 debug!(
                   conversation_id=%conv_id,
-                  prev_boundary_request_id=%prev.summarized_until_request_id,
-                  new_boundary_request_id=%boundary_request_id,
-                  "history_summary 使用滚动摘要（增量更新）"
+                  head_size=head_size,
+                  max_for_full=max_input_for_full,
+                  "history_summary 使用全量摘要（head 足够小）"
                 );
+                // 使用全量摘要，不做滚动
+              } else if !delta.is_empty() {
+                // 策略2：如果 delta 接近输入上限，放弃滚动，使用全量摘要
+                let delta_ratio = delta_size as f32 / hs.max_summarization_input_chars as f32;
+                if delta_ratio > hs.rolling_fallback_threshold {
+                  debug!(
+                    conversation_id=%conv_id,
+                    delta_size=delta_size,
+                    max_input=hs.max_summarization_input_chars,
+                    delta_ratio=delta_ratio,
+                    threshold=hs.rolling_fallback_threshold,
+                    "history_summary 放弃滚动（delta 过大），使用全量摘要"
+                  );
+                  use_fallback_full_summary = true;
+                } else {
+                  // 正常滚动摘要
+                  let prev_exchange = AugmentChatHistory {
+                    response_text: String::new(),
+                    request_message: format!(
+                      "[PREVIOUS_SUMMARY]\n{}\n[/PREVIOUS_SUMMARY]",
+                      prev.summary_text.trim()
+                    ),
+                    request_id: "proxy_history_summary_prev".to_string(),
+                    request_nodes: Vec::new(),
+                    structured_request_nodes: Vec::new(),
+                    nodes: Vec::new(),
+                    response_nodes: Vec::new(),
+                    structured_output_nodes: Vec::new(),
+                  };
+                  let mut merged = Vec::with_capacity(1 + delta.len());
+                  merged.push(prev_exchange);
+                  merged.extend(delta);
+                  input_history = merged;
+                  used_rolling = true;
+                  prompt = format!(
+                    "{}\n\nYou will be given an existing summary and additional new conversation turns. Update the summary to include the new information. Output only the updated summary.",
+                    hs.prompt.trim()
+                  );
+                  debug!(
+                    conversation_id=%conv_id,
+                    prev_boundary_request_id=%prev.summarized_until_request_id,
+                    new_boundary_request_id=%boundary_request_id,
+                    "history_summary 使用滚动摘要（增量更新）"
+                  );
+                }
               }
             }
           }
         }
       }
 
+      // 如果需要回退到全量摘要，重新使用 dropped_head
+      if use_fallback_full_summary {
+        input_history = dropped_head.clone();
+        used_rolling = false;
+      }
+
       if hs.max_summarization_input_chars > 0 {
         if used_rolling {
-          while input_history.len() > 1
+          // 滚动摘要：保留 PREVIOUS_SUMMARY + 至少 min_delta_exchanges_to_keep 个 delta
+          let min_keep = hs.min_delta_exchanges_to_keep.max(1);
+          while input_history.len() > (1 + min_keep)
             && estimate_history_size_chars(&input_history) > hs.max_summarization_input_chars
           {
-            input_history.remove(1);
+            // 从尾部删除最早的 delta（保留 PREVIOUS_SUMMARY 和最近的 delta）
+            let remove_idx = input_history.len() - 1;
+            if remove_idx > 1 {
+              input_history.remove(remove_idx);
+            } else {
+              break;
+            }
+          }
+          // 如果删到极限仍超限，回退到全量摘要
+          if input_history.len() > (1 + min_keep)
+            && estimate_history_size_chars(&input_history) > hs.max_summarization_input_chars
+          {
+            debug!(conversation_id=%conv_id, "history_summary 滚动摘要超限，回退到全量摘要");
+            input_history = dropped_head.clone();
           }
         } else {
           while !input_history.is_empty()

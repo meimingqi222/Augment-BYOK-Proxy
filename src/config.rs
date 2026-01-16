@@ -55,18 +55,20 @@ fn default_history_summary_max_summarization_input_chars() -> usize {
 }
 
 fn default_history_summary_prompt() -> String {
-  r#"
-You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
+  r#"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary for another LLM that will resume the task.
 
 Include:
 - Current progress and key decisions made
 - Important context, constraints, or user preferences
 - What remains to be done (clear next steps)
 - Any critical data, examples, or references needed to continue
+- Key tool invocations (with tool name and brief input/output summary)
+- Important errors or issues encountered and their resolutions
+- Critical file modifications (which files were changed and why)
 
-Be concise, structured, and focused on helping the next LLM seamlessly continue the work.
-"#
-    .trim()
+For tool invocations, summarize the tool name and what was accomplished. For file modifications, note the file path and purpose of the change.
+
+Be concise, structured, and focused on helping the next LLM seamlessly continue the work. If you are unsure about any past step or tool result, explicitly say so instead of guessing."#
     .to_string()
 }
 
@@ -75,11 +77,23 @@ fn default_history_summary_trigger_strategy() -> String {
 }
 
 fn default_history_summary_trigger_on_context_ratio() -> f32 {
-  0.70
+  0.60
 }
 
 fn default_history_summary_target_context_ratio() -> f32 {
-  0.55
+  0.45
+}
+
+fn default_history_summary_min_delta_exchanges_to_keep() -> usize {
+  3
+}
+
+fn default_history_summary_rolling_fallback_threshold() -> f32 {
+  0.80
+}
+
+fn default_history_summary_bytes_per_token_estimate() -> f32 {
+  4.0
 }
 
 fn is_valid_history_summary_template_new_mode(template: &str) -> bool {
@@ -404,6 +418,12 @@ pub struct HistorySummaryConfig {
   pub history_tail_size_chars_to_exclude: usize,
   #[serde(default = "default_history_summary_min_tail_exchanges")]
   pub min_tail_exchanges: usize,
+  #[serde(default = "default_history_summary_min_delta_exchanges_to_keep")]
+  pub min_delta_exchanges_to_keep: usize,
+  #[serde(default = "default_history_summary_rolling_fallback_threshold")]
+  pub rolling_fallback_threshold: f32,
+  #[serde(default = "default_history_summary_bytes_per_token_estimate")]
+  pub bytes_per_token_estimate: f32,
   #[serde(default = "default_history_summary_cache_ttl_ms")]
   pub cache_ttl_ms: u64,
   #[serde(default = "default_history_summary_max_summarization_input_chars")]
@@ -435,6 +455,9 @@ impl Default for HistorySummaryConfig {
       history_tail_size_chars_to_exclude:
         default_history_summary_history_tail_size_chars_to_exclude(),
       min_tail_exchanges: default_history_summary_min_tail_exchanges(),
+      min_delta_exchanges_to_keep: default_history_summary_min_delta_exchanges_to_keep(),
+      rolling_fallback_threshold: default_history_summary_rolling_fallback_threshold(),
+      bytes_per_token_estimate: default_history_summary_bytes_per_token_estimate(),
       cache_ttl_ms: default_history_summary_cache_ttl_ms(),
       max_summarization_input_chars: default_history_summary_max_summarization_input_chars(),
       prompt: default_history_summary_prompt(),
@@ -488,6 +511,15 @@ impl HistorySummaryConfig {
     if self.min_tail_exchanges == 0 {
       anyhow::bail!("history_summary.min_tail_exchanges 不能为 0");
     }
+    if self.min_delta_exchanges_to_keep == 0 {
+      anyhow::bail!("history_summary.min_delta_exchanges_to_keep 不能为 0");
+    }
+    if !(0.0..=1.0).contains(&self.rolling_fallback_threshold) || self.rolling_fallback_threshold <= 0.0 {
+      anyhow::bail!("history_summary.rolling_fallback_threshold 取值范围为 (0,1]");
+    }
+    if self.bytes_per_token_estimate <= 0.0 || self.bytes_per_token_estimate > 10.0 {
+      anyhow::bail!("history_summary.bytes_per_token_estimate 取值范围为 (0,10]");
+    }
     if self.summary_node_request_message_template.trim().is_empty() {
       anyhow::bail!("history_summary.summary_node_request_message_template 不能为空");
     }
@@ -524,7 +556,7 @@ pub struct AbridgedHistoryParams {
 }
 
 fn default_abridged_total_chars_limit() -> usize {
-  10_000
+  15_000
 }
 
 fn default_abridged_user_message_chars_limit() -> usize {
