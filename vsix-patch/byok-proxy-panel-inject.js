@@ -50,9 +50,10 @@
       const cfg = vscode && vscode.workspace && vscode.workspace.getConfiguration ? vscode.workspace.getConfiguration("augment") : null;
       const adv = cfg && cfg.get ? cfg.get("advanced") : null;
       const completionURL = normalizeString(adv && typeof adv === "object" ? adv.completionURL : "");
-      return { completionURL };
+      const apiToken = normalizeString(adv && typeof adv === "object" ? adv.apiToken : "");
+      return { completionURL, apiToken };
     } catch (_) {
-      return { completionURL: "" };
+      return { completionURL: "", apiToken: "" };
     }
   }
 
@@ -106,6 +107,7 @@
     .muted{color:var(--vscode-descriptionForeground);font-size:12px}
     pre{background:var(--vscode-textCodeBlock-background);padding:10px;white-space:pre-wrap;border-radius:4px;margin:0}
     .badge{display:inline-flex;align-items:center;gap:6px;border:1px solid var(--vscode-editorWidget-border);padding:2px 8px;border-radius:999px;font-size:12px;color:var(--vscode-descriptionForeground)}
+    .badge.danger{border-color:var(--vscode-inputValidation-errorBorder);color:var(--vscode-errorForeground)}
     .inlineNote{margin-top:6px}
   </style>
 </head>
@@ -119,6 +121,7 @@
 			        <strong>连接</strong>
 			        <div class="row" style="gap:8px">
 		          <span class="badge" id="modelsStatus">models: 0</span>
+		          <span class="badge" id="tokenStatus">token: unknown</span>
 		          <button id="refreshModels">刷新模型</button>
 		          <button id="openAdmin" class="primary">打开 /admin</button>
 		          <button id="openSettings">设置</button>
@@ -194,14 +197,14 @@
 			    const $ = (id) => document.getElementById(id);
 			    const normalize = (v) => typeof v === 'string' ? v.trim() : '';
 			    const init = ${initJson};
-		    const state = { rules: {}, endpoints: [], models: [], historySummary: { enabled: false, model: '' } };
+		    const state = { rules: {}, endpoints: [], models: [], historySummary: { enabled: false, model: '' }, hasToken: false };
 
 		    function normalizeEndpoint(ep) {
 	      const s = normalize(ep);
 	      if (!s) return '';
 	      const p = s.startsWith('/') ? s : ('/' + s);
 	      return p.replace(/\\/+$/, '') || '/';
-		    }
+	    }
 	
 	    const implemented = new Set(Array.isArray(init.implementedEndpoints) ? init.implementedEndpoints.map(normalizeEndpoint).filter(Boolean) : []);
 	
@@ -214,6 +217,18 @@
 	      const n = Array.isArray(state.models) ? state.models.length : 0;
 	      $('modelsStatus').textContent = 'models: ' + String(n);
 	    }
+
+      function renderTokenStatus() {
+        const el = $('tokenStatus');
+        if (!el) return;
+        if (state.hasToken) {
+          el.textContent = 'token: ready';
+          el.classList.remove('danger');
+        } else {
+          el.textContent = 'token: missing';
+          el.classList.add('danger');
+        }
+      }
 
 	    function groupModelsByProvider(models) {
       const out = new Map();
@@ -390,8 +405,10 @@
 			          state.endpoints = Array.isArray(d.endpoints) ? d.endpoints.map(normalizeEndpoint).filter(Boolean) : [];
 			          state.models = Array.isArray(d.models) ? d.models.map(normalize).filter(Boolean) : [];
 			          state.historySummary = (d.historySummary && typeof d.historySummary === 'object') ? d.historySummary : { enabled: false, model: '' };
+			          state.hasToken = Boolean(d.hasToken);
 			          if (d.historySummaryStatus != null) setHistorySummaryStatus(d.historySummaryStatus);
 			          renderModelsStatus();
+			          renderTokenStatus();
 			          renderHistorySummary();
 			          renderRules();
 			        } catch (e) {
@@ -462,6 +479,13 @@
     return base + e;
   }
 
+  function buildAuthHeaders(apiToken, extra) {
+    const headers = Object.assign({}, extra || {});
+    const token = normalizeString(apiToken);
+    if (token) headers["authorization"] = `Bearer ${token}`;
+    return headers;
+  }
+
   async function loadTokenAndRouting(context) {
     const runtime = ensureRuntime();
     if (!runtime || !context) return;
@@ -486,11 +510,11 @@
     if (runtime) runtime.routing = { version: 1, rules: {} };
   }
 
-  async function fetchByokModels({ completionURL }) {
+  async function fetchByokModels({ completionURL, apiToken }) {
     const base = normalizeString(completionURL);
     if (!base) throw new Error("completionURL 为空");
     const url = joinBaseUrl(base, "get-models");
-    const headers = { "content-type": "application/json" };
+    const headers = buildAuthHeaders(apiToken, { "content-type": "application/json" });
     const resp = await fetch(url, { method: "POST", headers, body: "{}" });
     const text = await resp.text().catch(() => "");
     if (!resp.ok) throw new Error(`get-models 失败: ${resp.status} ${text.slice(0, 200)}`.trim());
@@ -516,11 +540,12 @@
     return { providerId, modelId };
   }
 
-  async function fetchProxyConfig({ completionURL }) {
+  async function fetchProxyConfig({ completionURL, apiToken }) {
     const base = normalizeString(completionURL);
     if (!base) throw new Error("completionURL 为空");
     const url = joinBaseUrl(base, "admin/api/config");
-    const resp = await fetch(url, { method: "GET" });
+    const headers = buildAuthHeaders(apiToken);
+    const resp = await fetch(url, { method: "GET", headers });
     const text = await resp.text().catch(() => "");
     if (!resp.ok) throw new Error(`admin/api/config 失败: ${resp.status} ${text.slice(0, 300)}`.trim());
     const json = text ? JSON.parse(text) : null;
@@ -538,8 +563,8 @@
     return { enabled, model };
   }
 
-  async function applyProxyHistorySummary({ completionURL, enabled, model }) {
-    const cfg = await fetchProxyConfig({ completionURL });
+  async function applyProxyHistorySummary({ completionURL, apiToken, enabled, model }) {
+    const cfg = await fetchProxyConfig({ completionURL, apiToken });
     if (!cfg.history_summary || typeof cfg.history_summary !== "object") cfg.history_summary = {};
     cfg.history_summary.enabled = Boolean(enabled);
 
@@ -553,7 +578,8 @@
     }
 
     const url = joinBaseUrl(normalizeString(completionURL), "admin/api/config");
-    const resp = await fetch(url, { method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(cfg) });
+    const headers = buildAuthHeaders(apiToken, { "content-type": "application/json" });
+    const resp = await fetch(url, { method: "PUT", headers, body: JSON.stringify(cfg) });
     const text = await resp.text().catch(() => "");
     const json = text ? JSON.parse(text) : null;
     if (!resp.ok) {
@@ -563,11 +589,12 @@
     return json;
   }
 
-  async function saveProxyConfigToFile({ completionURL }) {
+  async function saveProxyConfigToFile({ completionURL, apiToken }) {
     const base = normalizeString(completionURL);
     if (!base) throw new Error("completionURL 为空");
     const url = joinBaseUrl(base, "admin/api/config/save");
-    const resp = await fetch(url, { method: "POST" });
+    const headers = buildAuthHeaders(apiToken);
+    const resp = await fetch(url, { method: "POST", headers });
     const text = await resp.text().catch(() => "");
     const json = text ? JSON.parse(text) : null;
     if (!resp.ok) {
@@ -577,11 +604,12 @@
     return json;
   }
 
-  async function clearProxyHistorySummaryCacheAll({ completionURL }) {
+  async function clearProxyHistorySummaryCacheAll({ completionURL, apiToken }) {
     const base = normalizeString(completionURL);
     if (!base) throw new Error("completionURL 为空");
     const url = joinBaseUrl(base, "admin/api/history-summary-cache/clear");
-    const resp = await fetch(url, { method: "POST" });
+    const headers = buildAuthHeaders(apiToken);
+    const resp = await fetch(url, { method: "POST", headers });
     const text = await resp.text().catch(() => "");
     const json = text ? JSON.parse(text) : null;
     if (!resp.ok) {
@@ -665,7 +693,8 @@
             if (msg.type !== "rpc") return;
             const method = normalizeString(msg.method);
             const params = msg.params && typeof msg.params === "object" ? msg.params : {};
-            const completionURL = normalizeString(readAugmentAdvancedConfig(vscode).completionURL);
+            const { completionURL, apiToken } = readAugmentAdvancedConfig(vscode);
+            const hasToken = Boolean(apiToken);
             if (!completionURL && method !== "openSettings") throw new Error("augment.advanced.completionURL 为空");
 
             if (method === "getState") {
@@ -673,10 +702,10 @@
               const endpoints = Array.from(new Set([...IMPLEMENTED_ENDPOINTS.map(normalizeEndpoint), ...Object.keys(rules).map(normalizeEndpoint)])).filter(Boolean).sort((a, b) => a.localeCompare(b));
               let historySummary = { enabled: false, model: "" };
               try {
-                const proxyCfg = await fetchProxyConfig({ completionURL });
+                const proxyCfg = await fetchProxyConfig({ completionURL, apiToken });
                 historySummary = extractHistorySummaryState(proxyCfg);
               } catch (_) { }
-              panel.webview.postMessage({ type: "state", data: { rules, endpoints, models: runtime.models || [], historySummary } });
+              panel.webview.postMessage({ type: "state", data: { rules, endpoints, models: runtime.models || [], historySummary, hasToken } });
               return;
             }
             if (method === "openAdmin") {
@@ -699,31 +728,31 @@
               return;
             }
             if (method === "refreshModels") {
-              const models = await fetchByokModels({ completionURL });
+              const models = await fetchByokModels({ completionURL, apiToken });
               runtime.models = models;
               const rules = runtime.routing?.rules && typeof runtime.routing?.rules === "object" ? runtime.routing.rules : {};
               const endpoints = Array.from(new Set([...IMPLEMENTED_ENDPOINTS.map(normalizeEndpoint), ...Object.keys(rules).map(normalizeEndpoint)])).filter(Boolean).sort((a, b) => a.localeCompare(b));
               let historySummary = { enabled: false, model: "" };
               try {
-                const proxyCfg = await fetchProxyConfig({ completionURL });
+                const proxyCfg = await fetchProxyConfig({ completionURL, apiToken });
                 historySummary = extractHistorySummaryState(proxyCfg);
               } catch (_) { }
-              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary } });
+              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, hasToken } });
             }
 
             if (method === "refreshHistorySummary") {
               const rules = runtime.routing?.rules && typeof runtime.routing?.rules === "object" ? runtime.routing.rules : {};
               const endpoints = Array.from(new Set([...IMPLEMENTED_ENDPOINTS.map(normalizeEndpoint), ...Object.keys(rules).map(normalizeEndpoint)])).filter(Boolean).sort((a, b) => a.localeCompare(b));
               const models = runtime.models || [];
-              const proxyCfg = await fetchProxyConfig({ completionURL });
+              const proxyCfg = await fetchProxyConfig({ completionURL, apiToken });
               const historySummary = extractHistorySummaryState(proxyCfg);
-              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: { ok: true } } });
+              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: { ok: true }, hasToken } });
             }
 
             if (method === "applyHistorySummary") {
               const enabled = Boolean(params.enabled);
               const model = normalizeString(params.model);
-              const result = await applyProxyHistorySummary({ completionURL, enabled, model });
+              const result = await applyProxyHistorySummary({ completionURL, apiToken, enabled, model });
               try { vscode.window.showInformationMessage("History Summary 已应用到 Proxy（热更新）"); } catch (_) { }
 
               const rules = runtime.routing?.rules && typeof runtime.routing?.rules === "object" ? runtime.routing.rules : {};
@@ -731,38 +760,38 @@
               const models = runtime.models || [];
               let historySummary = { enabled: false, model: "" };
               try {
-                const proxyCfg = await fetchProxyConfig({ completionURL });
+                const proxyCfg = await fetchProxyConfig({ completionURL, apiToken });
                 historySummary = extractHistorySummaryState(proxyCfg);
               } catch (_) { }
-              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: result || { ok: true } } });
+              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: result || { ok: true }, hasToken } });
             }
 
             if (method === "saveProxyConfig") {
-              const result = await saveProxyConfigToFile({ completionURL });
+              const result = await saveProxyConfigToFile({ completionURL, apiToken });
               try { vscode.window.showInformationMessage("Proxy 配置已保存到 config.yaml"); } catch (_) { }
               const rules = runtime.routing?.rules && typeof runtime.routing?.rules === "object" ? runtime.routing.rules : {};
               const endpoints = Array.from(new Set([...IMPLEMENTED_ENDPOINTS.map(normalizeEndpoint), ...Object.keys(rules).map(normalizeEndpoint)])).filter(Boolean).sort((a, b) => a.localeCompare(b));
               const models = runtime.models || [];
               let historySummary = { enabled: false, model: "" };
               try {
-                const proxyCfg = await fetchProxyConfig({ completionURL });
+                const proxyCfg = await fetchProxyConfig({ completionURL, apiToken });
                 historySummary = extractHistorySummaryState(proxyCfg);
               } catch (_) { }
-              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: result || { ok: true } } });
+              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: result || { ok: true }, hasToken } });
             }
 
             if (method === "clearHistorySummaryCache") {
-              const result = await clearProxyHistorySummaryCacheAll({ completionURL });
+              const result = await clearProxyHistorySummaryCacheAll({ completionURL, apiToken });
               try { vscode.window.showInformationMessage("History Summary 缓存已清空"); } catch (_) { }
               const rules = runtime.routing?.rules && typeof runtime.routing?.rules === "object" ? runtime.routing.rules : {};
               const endpoints = Array.from(new Set([...IMPLEMENTED_ENDPOINTS.map(normalizeEndpoint), ...Object.keys(rules).map(normalizeEndpoint)])).filter(Boolean).sort((a, b) => a.localeCompare(b));
               const models = runtime.models || [];
               let historySummary = { enabled: false, model: "" };
               try {
-                const proxyCfg = await fetchProxyConfig({ completionURL });
+                const proxyCfg = await fetchProxyConfig({ completionURL, apiToken });
                 historySummary = extractHistorySummaryState(proxyCfg);
               } catch (_) { }
-              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: result || { ok: true } } });
+              return panel.webview.postMessage({ type: "state", data: { rules, endpoints, models, historySummary, historySummaryStatus: result || { ok: true }, hasToken } });
             }
           } catch (e) {
             try { vscode.window.showErrorMessage(`BYOK Proxy: ${String(e && e.message ? e.message : e)}`); } catch (_) { }

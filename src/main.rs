@@ -117,7 +117,171 @@ struct ModelCacheEntry {
   models: Vec<String>,
 }
 
-const ADMIN_HTML: &str = r#"<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Augment-BYOK-Proxy Admin</title><style>body{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Helvetica Neue",Arial,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei";margin:24px;max-width:980px}textarea{width:100%;min-height:420px;font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;font-size:12px}button{margin-right:8px;padding:8px 12px}small{color:#666}pre{background:#111;color:#eee;padding:12px;white-space:pre-wrap}</style></head><body><h1>Augment-BYOK-Proxy Admin</h1><p><small>说明：此页面直接编辑运行时配置（JSON）。<b>不支持</b>通过此接口热更新 <code>server.host/server.port</code> / <code>logging.filter</code>（需要重启进程）。</small></p><div style="margin:12px 0"><button id="reload">刷新</button><button id="apply">应用(热更新)</button><button id="save">保存到文件</button></div><textarea id="cfg" spellcheck="false"></textarea><h2>状态</h2><pre id="status">ready</pre><script>const $=s=>document.querySelector(s);const setStatus=(v)=>{$('#status').textContent=typeof v==='string'?v:JSON.stringify(v,null,2)};async function load(){setStatus('loading...');const r=await fetch('/admin/api/config');const t=await r.text();if(!r.ok){setStatus({ok:false,status:r.status,body:t});return}try{$('#cfg').value=JSON.stringify(JSON.parse(t),null,2);setStatus({ok:true})}catch(e){$('#cfg').value=t;setStatus({ok:false,error:'config JSON parse failed',detail:String(e)})}}async function apply(){let obj;try{obj=JSON.parse($('#cfg').value)}catch(e){setStatus({ok:false,error:'invalid JSON',detail:String(e)});return}setStatus('applying...');const r=await fetch('/admin/api/config',{method:'PUT',headers:{'content-type':'application/json'},body:JSON.stringify(obj)});const j=await r.json().catch(async()=>({ok:false,body:await r.text()}));setStatus(j);if(r.ok)await load()}async function save(){setStatus('saving...');const r=await fetch('/admin/api/config/save',{method:'POST'});const j=await r.json().catch(async()=>({ok:false,body:await r.text()}));setStatus(j)}$('#reload').addEventListener('click',load);$('#apply').addEventListener('click',apply);$('#save').addEventListener('click',save);load();</script></body></html>"#;
+const ADMIN_HTML: &str = r##"<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Augment-BYOK-Proxy Admin</title>
+    <style>
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, "Noto Sans", "PingFang SC", "Hiragino Sans GB",
+          "Microsoft YaHei";
+        margin: 24px;
+        max-width: 980px;
+      }
+      textarea {
+        width: 100%;
+        min-height: 420px;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+          "Liberation Mono", "Courier New", monospace;
+        font-size: 12px;
+      }
+      button {
+        margin-right: 8px;
+        padding: 8px 12px;
+      }
+      small {
+        color: #666;
+      }
+      pre {
+        background: #111;
+        color: #eee;
+        padding: 12px;
+        white-space: pre-wrap;
+      }
+      .panel {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+        align-items: center;
+        margin: 12px 0;
+      }
+      .token-input {
+        min-width: 320px;
+        flex: 1;
+        padding: 8px 10px;
+        border: 1px solid #ddd;
+        border-radius: 6px;
+        font-size: 13px;
+      }
+      .hint {
+        color: #a33;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Augment-BYOK-Proxy Admin</h1>
+    <p>
+      <small>
+        说明：此页面直接编辑运行时配置（JSON）。<b>不支持</b>通过此接口热更新
+        <code>server.host/server.port</code> / <code>logging.filter</code>（需要重启进程）。
+      </small>
+    </p>
+    <div class="panel">
+      <label>
+        <strong>Admin Token</strong>
+        <input id="token" class="token-input" placeholder="输入 proxy.auth_token" />
+      </label>
+      <button id="save-token">保存 Token</button>
+      <span id="token-status" class="hint"></span>
+    </div>
+    <div style="margin: 12px 0">
+      <button id="reload">刷新</button>
+      <button id="apply">应用(热更新)</button>
+      <button id="save">保存到文件</button>
+    </div>
+    <textarea id="cfg" spellcheck="false"></textarea>
+    <h2>状态</h2>
+    <pre id="status">ready</pre>
+    <script>
+      const $ = (s) => document.querySelector(s);
+      const TOKEN_KEY = "augment-byok-admin-token";
+      const setStatus = (v) => {
+        $("#status").textContent =
+          typeof v === "string" ? v : JSON.stringify(v, null, 2);
+      };
+      const setTokenHint = (msg) => {
+        $("#token-status").textContent = msg || "";
+      };
+      const readToken = () => {
+        return localStorage.getItem(TOKEN_KEY) || "";
+      };
+      const writeToken = (v) => {
+        localStorage.setItem(TOKEN_KEY, v || "");
+      };
+      const authHeaders = (extra) => {
+        const token = readToken().trim();
+        const headers = Object.assign({}, extra || {});
+        if (token) {
+          headers["authorization"] = `Bearer ${token}`;
+          setTokenHint("");
+        } else {
+          setTokenHint("未设置 token，接口将返回 401");
+        }
+        return headers;
+      };
+      async function load() {
+        setStatus("loading...");
+        const r = await fetch("/admin/api/config", {
+          headers: authHeaders(),
+        });
+        const t = await r.text();
+        if (!r.ok) {
+          setStatus({ ok: false, status: r.status, body: t });
+          return;
+        }
+        try {
+          $("#cfg").value = JSON.stringify(JSON.parse(t), null, 2);
+          setStatus({ ok: true });
+        } catch (e) {
+          $("#cfg").value = t;
+          setStatus({ ok: false, error: "config JSON parse failed", detail: String(e) });
+        }
+      }
+      async function apply() {
+        let obj;
+        try {
+          obj = JSON.parse($("#cfg").value);
+        } catch (e) {
+          setStatus({ ok: false, error: "invalid JSON", detail: String(e) });
+          return;
+        }
+        setStatus("applying...");
+        const r = await fetch("/admin/api/config", {
+          method: "PUT",
+          headers: authHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(obj),
+        });
+        const j = await r.json().catch(() => ({}));
+        setStatus({ ok: r.ok, status: r.status, body: j });
+      }
+      async function save() {
+        setStatus("saving...");
+        const r = await fetch("/admin/api/config/save", {
+          method: "POST",
+          headers: authHeaders(),
+        });
+        const j = await r.json().catch(() => ({}));
+        setStatus({ ok: r.ok, status: r.status, body: j });
+      }
+      $("#save-token").onclick = () => {
+        writeToken($("#token").value.trim());
+        setTokenHint("已保存");
+      };
+      $("#reload").onclick = load;
+      $("#apply").onclick = apply;
+      $("#save").onclick = save;
+      $("#token").value = readToken();
+      if (!$("#token").value) {
+        setTokenHint("未设置 token，接口将返回 401");
+      }
+      load();
+    </script>
+  </body>
+</html>"##;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -200,24 +364,48 @@ async fn health() -> impl IntoResponse {
   axum::Json(serde_json::json!({ "status": "ok", "service": "augment-byok-proxy" }))
 }
 
-async fn admin_index() -> impl IntoResponse {
-  Html(ADMIN_HTML)
+fn admin_unauthorized_json() -> (StatusCode, axum::Json<serde_json::Value>) {
+  (
+    StatusCode::UNAUTHORIZED,
+    axum::Json(serde_json::json!({
+      "ok": false,
+      "error": "unauthorized"
+    })),
+  )
 }
 
-async fn admin_get_config(State(state): State<AppState>) -> impl IntoResponse {
+async fn admin_index() -> impl IntoResponse {
+  Html(ADMIN_HTML).into_response()
+}
+
+async fn admin_get_config(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
   let cfg = state.cfg.read().await.clone();
-  axum::Json(cfg)
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let present = auth_present_headers(&headers);
+    warn!(present=?present, "admin/api/config 未授权访问");
+    return admin_unauthorized_json().into_response();
+  }
+  let cfg = state.cfg.read().await.clone();
+  axum::Json(cfg).into_response()
 }
 
 async fn admin_put_config(
   State(state): State<AppState>,
+  headers: HeaderMap,
   axum::Json(next): axum::Json<Config>,
 ) -> impl IntoResponse {
+  let cfg = state.cfg.read().await.clone();
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let present = auth_present_headers(&headers);
+    warn!(present=?present, "admin/api/config PUT 未授权访问");
+    return admin_unauthorized_json().into_response();
+  }
   if let Err(err) = next.validate() {
     return (
       StatusCode::BAD_REQUEST,
       axum::Json(serde_json::json!({ "ok": false, "error": format!("{err}") })),
-    );
+    )
+    .into_response();
   }
   let current = state.cfg.read().await.clone();
   if next.server.host != current.server.host || next.server.port != current.server.port {
@@ -226,7 +414,8 @@ async fn admin_put_config(
       axum::Json(
         serde_json::json!({ "ok": false, "error": "server.host/server.port 变更需要重启进程；本接口仅支持热更新上游相关配置" }),
       ),
-    );
+    )
+    .into_response();
   }
   if next.logging.filter.trim() != current.logging.filter.trim() {
     return (
@@ -234,39 +423,57 @@ async fn admin_put_config(
       axum::Json(
         serde_json::json!({ "ok": false, "error": "logging.filter 变更需要重启进程（暂不支持热更新）" }),
       ),
-    );
+    )
+    .into_response();
   }
   *state.cfg.write().await = next;
   (
     StatusCode::OK,
     axum::Json(serde_json::json!({ "ok": true })),
   )
+  .into_response()
 }
 
-async fn admin_save_config(State(state): State<AppState>) -> impl IntoResponse {
+async fn admin_save_config(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+  let cfg = state.cfg.read().await.clone();
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let present = auth_present_headers(&headers);
+    warn!(present=?present, "admin/api/config/save 未授权访问");
+    return admin_unauthorized_json().into_response();
+  }
   let cfg = state.cfg.read().await.clone();
   if let Err(err) = cfg.save(&state.config_path) {
     return (
       StatusCode::INTERNAL_SERVER_ERROR,
       axum::Json(serde_json::json!({ "ok": false, "error": format!("{err}") })),
-    );
+    )
+    .into_response();
   }
   (
     StatusCode::OK,
     axum::Json(serde_json::json!({ "ok": true, "path": state.config_path.display().to_string() })),
   )
+  .into_response()
 }
 
 async fn admin_delete_history_summary_cache(
   State(state): State<AppState>,
+  headers: HeaderMap,
   axum::Json(req): axum::Json<AdminDeleteHistorySummaryCacheReq>,
 ) -> impl IntoResponse {
+  let cfg = state.cfg.read().await.clone();
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let present = auth_present_headers(&headers);
+    warn!(present=?present, "admin/api/history-summary-cache/delete 未授权访问");
+    return admin_unauthorized_json().into_response();
+  }
   let cid = req.conversation_id.trim();
   if cid.is_empty() {
     return (
       StatusCode::BAD_REQUEST,
       axum::Json(serde_json::json!({ "ok": false, "error": "conversation_id 不能为空" })),
-    );
+    )
+    .into_response();
   }
 
   let (deleted, snapshot) = {
@@ -284,7 +491,8 @@ async fn admin_delete_history_summary_cache(
       return (
         StatusCode::INTERNAL_SERVER_ERROR,
         axum::Json(serde_json::json!({ "ok": false, "error": format!("{err}") })),
-      );
+      )
+      .into_response();
     }
   }
 
@@ -292,9 +500,19 @@ async fn admin_delete_history_summary_cache(
     StatusCode::OK,
     axum::Json(serde_json::json!({ "ok": true, "deleted": deleted })),
   )
+  .into_response()
 }
 
-async fn admin_clear_history_summary_cache(State(state): State<AppState>) -> impl IntoResponse {
+async fn admin_clear_history_summary_cache(
+  State(state): State<AppState>,
+  headers: HeaderMap,
+) -> impl IntoResponse {
+  let cfg = state.cfg.read().await.clone();
+  if !is_authorized(&headers, &cfg.proxy.auth_token) {
+    let present = auth_present_headers(&headers);
+    warn!(present=?present, "admin/api/history-summary-cache/clear 未授权访问");
+    return admin_unauthorized_json().into_response();
+  }
   let snapshot = {
     let mut guard = state.history_summary_cache.write().await;
     guard.clear_all();
@@ -307,12 +525,14 @@ async fn admin_clear_history_summary_cache(State(state): State<AppState>) -> imp
     return (
       StatusCode::INTERNAL_SERVER_ERROR,
       axum::Json(serde_json::json!({ "ok": false, "error": format!("{err}") })),
-    );
+    )
+    .into_response();
   }
   (
     StatusCode::OK,
     axum::Json(serde_json::json!({ "ok": true })),
   )
+  .into_response()
 }
 
 async fn chat_stream(
