@@ -555,6 +555,7 @@ async fn chat_stream(
       "⛔ chat-stream 已被禁用（byok routing: disabled）",
     ));
   }
+  // chat_stream 默认走 BYOK，只有明确设置 Official 时才转发到官方
   if mode == ByokMode::Official {
     let uri = if let Some(model) = query
       .model
@@ -588,10 +589,29 @@ async fn chat_stream(
     .await;
   }
   let dump_body = cfg.logging.dump_chat_stream_body;
+
+  // 记录请求中的模型名（用于调试标题生成问题）
+  let body_model: Option<String> = serde_json::from_slice::<serde_json::Value>(&body)
+    .ok()
+    .and_then(|v| v.get("model").and_then(|m| m.as_str()).map(str::to_string));
   if dump_body {
-    info!(len=body.len(), body=%format_chat_stream_body_for_log(&body), "chat-stream 请求");
+    let body_message_preview: Option<String> = serde_json::from_slice::<serde_json::Value>(&body)
+      .ok()
+      .and_then(|v| {
+        v.get("message")
+          .and_then(|m| m.as_str())
+          .map(|s| s.chars().take(100).collect())
+      });
+    info!(
+      len = body.len(),
+      mode = ?mode,
+      model = ?body_model,
+      msg_preview = ?body_message_preview,
+      body = %format_chat_stream_body_for_log(&body),
+      "chat-stream 请求"
+    );
   } else {
-    debug!(len = body.len(), "chat-stream 请求");
+    debug!(len = body.len(), mode = ?mode, model = ?body_model, "chat-stream 请求");
   }
 
   let mut augment = match parse_augment_request(&body) {
@@ -686,10 +706,47 @@ async fn chat_stream(
   match provider {
     ProviderRef::Anthropic(provider) => {
       let model = clean_model(&raw_model);
+      info!(raw_model=%raw_model, cleaned_model=%model, provider_id=%provider.id, "chat-stream 使用模型");
       let anthropic_req = match convert_augment_to_anthropic(provider, &augment, model) {
         Ok(v) => v,
         Err(err) => return ndjson_response(error_response(format!("⚠️ 转换请求失败: {err}"))),
       };
+
+      // 打印发送给上游的请求体
+      if dump_body {
+        let msg_count = anthropic_req.messages.len();
+        let has_tools = anthropic_req.tools.as_ref().map_or(0, |t| t.len());
+        let has_thinking = anthropic_req.thinking.is_some();
+        let system_len = anthropic_req.system.as_ref().map_or(0, |s| s.len());
+        info!(
+          messages_count=%msg_count,
+          tools_count=%has_tools,
+          thinking=%has_thinking,
+          system_len=%system_len,
+          max_tokens=%anthropic_req.max_tokens,
+          "[UPSTREAM_REQ] Anthropic 请求概要"
+        );
+        // 打印每条消息的角色和内容长度
+        for (i, msg) in anthropic_req.messages.iter().enumerate() {
+          let content_len: usize = msg.content.iter().map(|b| {
+            b.text.as_ref().map_or(0, |t| t.len())
+              + b.thinking.as_ref().map_or(0, |t| t.len())
+          }).sum();
+          let block_types: Vec<&str> = msg.content.iter().map(|b| b.block_type.as_str()).collect();
+          info!(
+            msg_index=%i,
+            role=%msg.role,
+            blocks=%format!("{:?}", block_types),
+            content_len=%content_len,
+            "[UPSTREAM_REQ] 消息详情"
+          );
+        }
+        // 打印完整请求 JSON
+        if let Ok(json_str) = serde_json::to_string(&anthropic_req) {
+          let preview = truncate_for_log(json_str, 3000);
+          info!(request_json=%preview, "[UPSTREAM_REQ] 完整请求 JSON");
+        }
+      }
 
       let url = match join_url(&provider.base_url, "messages") {
         Ok(u) => u,
@@ -741,10 +798,22 @@ async fn chat_stream(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+      let content_length = resp
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("unknown")
+        .to_string();
+      let transfer_encoding = resp
+        .headers()
+        .get("transfer-encoding")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("none")
+        .to_string();
       if dump_body {
-        info!(status=%resp.status(), content_type=%content_type, "上游响应");
+        info!(status=%resp.status(), content_type=%content_type, content_length=%content_length, transfer_encoding=%transfer_encoding, "上游响应");
       } else {
-        debug!(status=%resp.status(), content_type=%content_type, "上游响应");
+        debug!(status=%resp.status(), content_type=%content_type, content_length=%content_length, transfer_encoding=%transfer_encoding, "上游响应");
       }
       if !content_type
         .trim()
@@ -770,7 +839,23 @@ async fn chat_stream(
         let mut lines = tokio::io::BufReader::new(reader).lines();
         let mut sse_event_type: Option<String> = None;
 
-        while let Ok(Some(line)) = lines.next_line().await {
+        let mut raw_line_count: usize = 0;
+        let mut first_lines: Vec<String> = Vec::new();
+        let mut stream_error: Option<String> = None;
+        loop {
+          let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break,
+            Err(e) => {
+              stream_error = Some(format!("{e}"));
+              break;
+            }
+          };
+
+          raw_line_count += 1;
+          if first_lines.len() < 10 {
+            first_lines.push(truncate_for_log(line.clone(), 200));
+          }
           if line.is_empty() {
             sse_event_type = None;
             continue;
@@ -795,9 +880,9 @@ async fn chat_stream(
           }
 
           for chunk in convert_event_to_chunks(&mut state_machine, event) {
-            if let Ok(line) = serde_json::to_string(&chunk) {
+            if let Ok(json_line) = serde_json::to_string(&chunk) {
               emitted_chunks += 1;
-              yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
+              yield Ok::<Bytes, Infallible>(Bytes::from(format!("{json_line}\n")));
             }
           }
         }
@@ -808,10 +893,12 @@ async fn chat_stream(
           || state_machine.usage_cache_creation_input_tokens.is_some();
 
         if emitted_chunks == 0 && !has_usage {
-          let msg = format!("❌ 未解析到任何上游 SSE 内容（data_lines={data_lines}, parsed_events={parsed_events}）；请检查 byok.providers[type=anthropic].base_url 是否真的是 Anthropic /messages SSE");
+          let first_preview = first_lines.join(" | ");
+          let err_detail = stream_error.as_deref().unwrap_or("none");
+          let msg = format!("❌ 未解析到任何上游 SSE 内容（raw_lines={raw_line_count}, data_lines={data_lines}, parsed_events={parsed_events}, stream_error={err_detail}）；first_lines: [{first_preview}]；请检查 byok.providers[type=anthropic].base_url 是否真的是 Anthropic /messages SSE");
           let error_chunk = error_response(msg);
-          if let Ok(line) = serde_json::to_string(&error_chunk) {
-            yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));
+          if let Ok(json_line) = serde_json::to_string(&error_chunk) {
+            yield Ok::<Bytes, Infallible>(Bytes::from(format!("{json_line}\n")));
           }
           return;
         }
@@ -914,6 +1001,8 @@ async fn chat_stream(
         let mut data_lines: usize = 0;
         let mut parsed_chunks: usize = 0;
         let mut emitted_chunks: usize = 0;
+        let mut first_data_lines: Vec<String> = Vec::new();
+        let mut parse_errors: Vec<String> = Vec::new();
         let bytes_stream = resp.bytes_stream().map(|r| r.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e)));
         let reader = StreamReader::new(bytes_stream);
         let mut lines = tokio::io::BufReader::new(reader).lines();
@@ -925,13 +1014,21 @@ async fn chat_stream(
           let Some(data) = line.strip_prefix("data:") else { continue };
           let data = data.trim_start();
           data_lines += 1;
+          if first_data_lines.len() < 5 {
+            first_data_lines.push(truncate_for_log(data.to_string(), 500));
+          }
           if data == "[DONE]" {
             break;
           }
 
           let chunk: OpenAIChatCompletionChunk = match serde_json::from_str(data) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+              if parse_errors.len() < 3 {
+                parse_errors.push(format!("JSON parse error: {e}"));
+              }
+              continue;
+            }
           };
           parsed_chunks += 1;
 
@@ -985,7 +1082,9 @@ async fn chat_stream(
         let has_usage = state_machine.usage_input_tokens.is_some() || state_machine.usage_output_tokens.is_some();
         let has_tool_calls = !state_machine.tool_calls.is_empty();
         if emitted_chunks == 0 && !has_usage && !has_tool_calls {
-          let msg = format!("❌ 未解析到任何上游 SSE 内容（data_lines={data_lines}, parsed_chunks={parsed_chunks}）；请检查 byok.providers[type=openai_compatible].base_url 是否真的是 OpenAI /chat/completions SSE");
+          let data_preview = first_data_lines.join(" | ");
+          let errors_preview = parse_errors.join("; ");
+          let msg = format!("❌ 未解析到任何上游 SSE 内容（data_lines={data_lines}, parsed_chunks={parsed_chunks}）；first_data: [{data_preview}]；errors: [{errors_preview}]");
           let error_chunk = error_response(msg);
           if let Ok(line) = serde_json::to_string(&error_chunk) {
             yield Ok::<Bytes, Infallible>(Bytes::from(format!("{line}\n")));

@@ -26,12 +26,50 @@ use crate::{
   },
 };
 
+fn last_assistant_tool_use_ids(history: &AugmentChatHistory) -> Vec<String> {
+  let mut tool_use_ids: Vec<String> = Vec::new();
+  let mut tool_use_start_ids: Vec<String> = Vec::new();
+  for n in history
+    .response_nodes
+    .iter()
+    .chain(&history.structured_output_nodes)
+  {
+    if n.node_type == RESPONSE_NODE_TOOL_USE {
+      if let Some(id) = n.tool_use.as_ref().map(|t| t.tool_use_id.clone()) {
+        tool_use_ids.push(id);
+      }
+    } else if n.node_type == RESPONSE_NODE_TOOL_USE_START {
+      if let Some(id) = n.tool_use.as_ref().map(|t| t.tool_use_id.clone()) {
+        tool_use_start_ids.push(id);
+      }
+    }
+  }
+
+  let chosen = if tool_use_ids.is_empty() {
+    tool_use_start_ids
+  } else {
+    tool_use_ids
+  };
+
+  let mut seen: HashSet<String> = HashSet::new();
+  chosen
+    .into_iter()
+    .filter(|id| !id.trim().is_empty() && seen.insert(id.clone()))
+    .collect()
+}
+
 pub fn clean_model(model: &str) -> String {
   let model = model.trim();
+  // Handle gemini-claude- prefix
   if let Some(stripped) = model.strip_prefix("gemini-") {
     if stripped.starts_with("claude-") {
       return stripped.to_string();
     }
+  }
+  // cliproxy 对 minimax 模型名大小写敏感，必须用小写
+  let lower = model.to_ascii_lowercase();
+  if lower.starts_with("minimax") {
+    return lower;
   }
   model.to_string()
 }
@@ -87,6 +125,14 @@ pub fn convert_augment_to_anthropic(
     )?;
   }
 
+  // 检查最后一条历史记录的 assistant 消息是否以 tool_use 结尾
+  // 如果是，需要确保当前用户消息以 tool_result 开头
+  let last_assistant_tool_use_ids: Vec<String> = augment
+    .chat_history
+    .last()
+    .map(last_assistant_tool_use_ids)
+    .unwrap_or_default();
+
   let virtual_nodes = build_virtual_context_text_nodes(augment);
   let current_nodes = augment
     .nodes
@@ -94,14 +140,60 @@ pub fn convert_augment_to_anthropic(
     .chain(&augment.structured_request_nodes)
     .chain(&augment.request_nodes)
     .chain(virtual_nodes.iter());
+
+  // 收集当前请求中已有的 tool_result IDs
+  let existing_tool_result_ids: std::collections::HashSet<String> = augment
+    .nodes
+    .iter()
+    .chain(&augment.structured_request_nodes)
+    .chain(&augment.request_nodes)
+    .filter_map(|n| {
+      if n.node_type == REQUEST_NODE_TOOL_RESULT {
+        n.tool_result_node.as_ref().map(|t| t.tool_use_id.clone())
+      } else {
+        None
+      }
+    })
+    .collect();
+
+  // 为缺失的 tool_use 生成占位 tool_result（仅当当前请求没有对应的 tool_result 时）
+  let missing_tool_results: Vec<AnthropicContentBlock> = last_assistant_tool_use_ids
+    .iter()
+    .filter(|id| !id.trim().is_empty() && !existing_tool_result_ids.contains(*id))
+    .map(|id| {
+      AnthropicContentBlock {
+        block_type: "tool_result".to_string(),
+        text: None,
+        source: None,
+        id: None,
+        name: None,
+        input: None,
+        tool_use_id: Some(id.clone()),
+        content: Some(serde_json::Value::String("[Tool result not available]".to_string())),
+        is_error: Some(false),
+        thinking: None,
+        signature: None,
+      }
+    })
+    .collect();
+
   if !augment.message.is_empty() || current_nodes.clone().next().is_some() {
     let user_content = build_user_content_blocks(&augment.message, current_nodes, true)?;
-    if !user_content.is_empty() {
+    if !user_content.is_empty() || !missing_tool_results.is_empty() {
+      // 如果有缺失的 tool_result，需要先添加它们，再添加用户消息
+      let mut final_content = missing_tool_results;
+      final_content.extend(user_content);
       messages.push(AnthropicMessage {
         role: "user".to_string(),
-        content: user_content,
+        content: final_content,
       });
     }
+  } else if !missing_tool_results.is_empty() {
+    // 即使没有用户消息，也需要添加占位 tool_result
+    messages.push(AnthropicMessage {
+      role: "user".to_string(),
+      content: missing_tool_results,
+    });
   }
 
   let tools = convert_tools(&augment.tool_definitions)?;
@@ -548,6 +640,13 @@ pub fn convert_augment_to_openai_compatible(
     )?;
   }
 
+  // 检查最后一条历史记录的 assistant 消息是否有 tool_calls
+  let last_assistant_tool_call_ids: Vec<String> = augment
+    .chat_history
+    .last()
+    .map(last_assistant_tool_use_ids)
+    .unwrap_or_default();
+
   let mut current_nodes: Vec<&NodeIn> = augment
     .nodes
     .iter()
@@ -556,6 +655,30 @@ pub fn convert_augment_to_openai_compatible(
     .collect();
   let virtual_nodes = build_virtual_context_text_nodes(augment);
   current_nodes.extend(virtual_nodes.iter());
+
+  // 收集当前请求中已有的 tool_result IDs
+  let existing_tool_result_ids: std::collections::HashSet<String> = current_nodes
+    .iter()
+    .filter_map(|n| {
+      if n.node_type == REQUEST_NODE_TOOL_RESULT {
+        n.tool_result_node.as_ref().map(|t| t.tool_use_id.clone())
+      } else {
+        None
+      }
+    })
+    .collect();
+
+  // 为缺失的 tool_calls 生成占位 tool result 消息
+  for id in &last_assistant_tool_call_ids {
+    if !id.trim().is_empty() && !existing_tool_result_ids.contains(id) {
+      messages.push(OpenAIChatMessage {
+        role: "tool".to_string(),
+        content: Some(Value::String("[Tool result not available]".to_string())),
+        tool_calls: None,
+        tool_call_id: Some(id.clone()),
+      });
+    }
+  }
 
   messages.extend(build_openai_tool_messages_from_request_nodes(
     current_nodes.iter().copied(),
@@ -2140,6 +2263,18 @@ mod tests {
     n
   }
 
+  fn make_tool_use_start_node(id: i32, tool_use_id: &str) -> NodeIn {
+    let mut n = empty_node(id, RESPONSE_NODE_TOOL_USE_START);
+    n.tool_use = Some(ToolUse {
+      tool_use_id: tool_use_id.to_string(),
+      tool_name: "view".to_string(),
+      input_json: "{\"path\":\"README.md\"}".to_string(),
+      mcp_server_name: String::new(),
+      mcp_tool_name: String::new(),
+    });
+    n
+  }
+
   fn make_tool_result_node(id: i32, tool_use_id: &str) -> NodeIn {
     let mut n = empty_node(id, REQUEST_NODE_TOOL_RESULT);
     n.tool_result_node = Some(ToolResultNode {
@@ -2512,6 +2647,128 @@ mod tests {
       .collect();
     assert_eq!(tool_result_blocks.len(), 1);
     assert_eq!(tool_result_blocks[0].tool_use_id.as_deref(), Some("tool-1"));
+  }
+
+  #[test]
+  fn anthropic_missing_tool_results_dedups_tool_use_ids() {
+    let provider = AnthropicProviderConfig {
+      id: "a1".to_string(),
+      base_url: "https://api.anthropic.com/v1".to_string(),
+      api_key: "sk-test".to_string(),
+      default_model: "claude-3-5-sonnet-latest".to_string(),
+      max_tokens: 1234,
+      timeout_seconds: 120,
+      extra_headers: BTreeMap::new(),
+      thinking: ThinkingConfig {
+        enabled: false,
+        budget_tokens: 0,
+      },
+    };
+
+    let history = vec![AugmentChatHistory {
+      request_message: "hi".to_string(),
+      request_id: "r1".to_string(),
+      request_nodes: Vec::new(),
+      structured_request_nodes: Vec::new(),
+      nodes: Vec::new(),
+      response_text: String::new(),
+      response_nodes: vec![
+        make_tool_use_start_node(1, "tool-1"),
+        make_tool_use_node(2, "tool-1"),
+      ],
+      structured_output_nodes: Vec::new(),
+    }];
+
+    let augment = AugmentRequest {
+      model: None,
+      chat_history: history,
+      message: "hi".to_string(),
+      agent_memories: String::new(),
+      mode: "CHAT".to_string(),
+      prefix: String::new(),
+      selected_code: String::new(),
+      suffix: String::new(),
+      diff: String::new(),
+      lang: String::new(),
+      path: String::new(),
+      user_guidelines: String::new(),
+      workspace_guidelines: String::new(),
+      rules: Value::Null,
+      tool_definitions: Vec::new(),
+      nodes: Vec::new(),
+      structured_request_nodes: Vec::new(),
+      request_nodes: Vec::new(),
+      conversation_id: None,
+      context: None,
+    };
+
+    let out = convert_augment_to_anthropic(&provider, &augment, "m".to_string()).unwrap();
+    let tool_result_blocks: Vec<&AnthropicContentBlock> = out
+      .messages
+      .iter()
+      .flat_map(|m| m.content.iter())
+      .filter(|b| b.block_type == "tool_result")
+      .collect();
+    assert_eq!(tool_result_blocks.len(), 1);
+    assert_eq!(tool_result_blocks[0].tool_use_id.as_deref(), Some("tool-1"));
+  }
+
+  #[test]
+  fn openai_missing_tool_results_dedups_tool_call_ids() {
+    let provider = OpenAICompatibleProviderConfig {
+      id: "o1".to_string(),
+      base_url: "https://api.openai.com/v1".to_string(),
+      api_key: "sk-test".to_string(),
+      default_model: "gpt-4o-mini".to_string(),
+      max_tokens: 1234,
+      timeout_seconds: 120,
+      extra_headers: BTreeMap::new(),
+    };
+
+    let history = vec![AugmentChatHistory {
+      request_message: "hi".to_string(),
+      request_id: "r1".to_string(),
+      request_nodes: Vec::new(),
+      structured_request_nodes: Vec::new(),
+      nodes: Vec::new(),
+      response_text: String::new(),
+      response_nodes: vec![
+        make_tool_use_start_node(1, "tool-1"),
+        make_tool_use_node(2, "tool-1"),
+      ],
+      structured_output_nodes: Vec::new(),
+    }];
+
+    let augment = AugmentRequest {
+      model: None,
+      chat_history: history,
+      message: "hi".to_string(),
+      agent_memories: String::new(),
+      mode: "CHAT".to_string(),
+      prefix: String::new(),
+      selected_code: String::new(),
+      suffix: String::new(),
+      diff: String::new(),
+      lang: String::new(),
+      path: String::new(),
+      user_guidelines: String::new(),
+      workspace_guidelines: String::new(),
+      rules: Value::Null,
+      tool_definitions: Vec::new(),
+      nodes: Vec::new(),
+      structured_request_nodes: Vec::new(),
+      request_nodes: Vec::new(),
+      conversation_id: None,
+      context: None,
+    };
+
+    let out =
+      convert_augment_to_openai_compatible(&provider, &augment, "gpt-4o-mini".to_string()).unwrap();
+
+    let tool_msgs: Vec<&OpenAIChatMessage> =
+      out.messages.iter().filter(|m| m.role == "tool").collect();
+    assert_eq!(tool_msgs.len(), 1);
+    assert_eq!(tool_msgs[0].tool_call_id.as_deref(), Some("tool-1"));
   }
 
   #[test]

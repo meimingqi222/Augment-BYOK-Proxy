@@ -76,7 +76,7 @@
       "connect-src http: https:"
     ].join("; ");
 
-    const initJson = JSON.stringify({ implementedEndpoints: IMPLEMENTED_ENDPOINTS });
+    const initJson = JSON.stringify({ ...initial, implementedEndpoints: IMPLEMENTED_ENDPOINTS });
 
     return `<!doctype html>
 <html lang="zh-CN">
@@ -116,18 +116,33 @@
 		    <h2 style="margin:0 0 6px 0">${escapeHtml(TITLE)}</h2>
 		    <div class="muted">管理端点路由、模型与上下文压缩；更完整的代理配置可在 <code>/admin</code> 调整。</div>
 
-			    <div class="card">
-			      <div class="cardHeader">
-			        <strong>连接</strong>
-			        <div class="row" style="gap:8px">
-		          <span class="badge" id="modelsStatus">models: 0</span>
-		          <span class="badge" id="tokenStatus">token: unknown</span>
-		          <button id="refreshModels">刷新模型</button>
-		          <button id="openAdmin" class="primary">打开 /admin</button>
-		          <button id="openSettings">设置</button>
-		        </div>
-			      </div>
-		    </div>
+				    <div class="card">
+				      <div class="cardHeader">
+				        <strong>连接</strong>
+				        <div class="row" style="gap:8px">
+			          <span class="badge" id="modelsStatus">models: 0</span>
+			          <span class="badge" id="tokenStatus">token: unknown</span>
+			          <button id="refreshModels">刷新模型</button>
+			          <button id="openAdmin" class="primary">打开 /admin</button>
+			          <button id="openSettings">设置</button>
+			        </div>
+				      </div>
+				      <div class="cardBody">
+				        <div class="grid">
+				          <div>
+				            <label>completionURL</label>
+				            <input id="completionURL" type="text" placeholder="http://127.0.0.1:8317/" />
+				          </div>
+				          <div>
+				            <label>apiToken</label>
+				            <input id="apiToken" type="password" placeholder="建议使用环境变量或配置文件设置" />
+				          </div>
+				        </div>
+				        <div class="row" style="margin-top:12px; justify-content: flex-end">
+				          <button id="updateAdvancedConfig" class="primary">更新连接设置</button>
+				        </div>
+				      </div>
+				    </div>
 
 		    <div class="card">
 		      <div class="cardHeader">
@@ -198,6 +213,14 @@
 			    const normalize = (v) => typeof v === 'string' ? v.trim() : '';
 			    const init = ${initJson};
 		    const state = { rules: {}, endpoints: [], models: [], historySummary: { enabled: false, model: '' }, hasToken: false };
+
+    $('completionURL').value = init.completionURL || '';
+    $('apiToken').value = init.apiToken || '';
+    $('updateAdvancedConfig').addEventListener('click', () => {
+      const completionURL = normalize($('completionURL').value);
+      const apiToken = normalize($('apiToken').value);
+      vscode.postMessage({ type: 'rpc', method: 'updateAdvancedConfig', params: { completionURL, apiToken } });
+    });
 
 		    function normalizeEndpoint(ep) {
 	      const s = normalize(ep);
@@ -683,19 +706,19 @@
       try {
         const initial = readAugmentAdvancedConfig(vscode);
         const panel = vscode.window.createWebviewPanel(VIEW_TYPE, TITLE, vscode.ViewColumn.Active, { enableScripts: true, retainContextWhenHidden: true });
-        panel.webview.html = buildHtml(initial);
-        panel.webview.onDidReceiveMessage(async (msg) => {
-          try {
-            if (!msg || typeof msg !== "object") return;
+	        panel.webview.html = buildHtml(initial);
+	        panel.webview.onDidReceiveMessage(async (msg) => {
+	          try {
+	            if (!msg || typeof msg !== "object") return;
             if (msg.type === "openExternal" && typeof msg.url === "string" && msg.url.trim()) {
               return vscode.env.openExternal(vscode.Uri.parse(msg.url.trim()));
             }
-            if (msg.type !== "rpc") return;
-            const method = normalizeString(msg.method);
-            const params = msg.params && typeof msg.params === "object" ? msg.params : {};
-            const { completionURL, apiToken } = readAugmentAdvancedConfig(vscode);
-            const hasToken = Boolean(apiToken);
-            if (!completionURL && method !== "openSettings") throw new Error("augment.advanced.completionURL 为空");
+	            if (msg.type !== "rpc") return;
+	            const method = normalizeString(msg.method);
+	            const params = msg.params && typeof msg.params === "object" ? msg.params : {};
+	            const { completionURL, apiToken } = readAugmentAdvancedConfig(vscode);
+	            const hasToken = Boolean(apiToken);
+	            if (!completionURL && method !== "openSettings" && method !== "updateAdvancedConfig") throw new Error("augment.advanced.completionURL 为空");
 
             if (method === "getState") {
               const rules = runtime.routing?.rules && typeof runtime.routing?.rules === "object" ? runtime.routing.rules : {};
@@ -715,6 +738,16 @@
             }
             if (method === "openSettings") {
               try { await vscode.commands.executeCommand("workbench.action.openSettings", "augment.advanced"); } catch (_) { await vscode.commands.executeCommand("workbench.action.openSettings"); }
+              return;
+            }
+	            if (method === "updateAdvancedConfig") {
+	              const completionURL = normalizeString(params.completionURL);
+	              const apiToken = normalizeString(params.apiToken);
+	              const cfg = vscode.workspace.getConfiguration("augment");
+	              const oldAdv = cfg.get("advanced") || {};
+	              const nextAdv = { ...oldAdv, completionURL, apiToken };
+	              await cfg.update("advanced", nextAdv, vscode.ConfigurationTarget.Global);
+	              try { vscode.window.showInformationMessage("BYOK Proxy 连接设置已更新"); } catch (_) { }
               return;
             }
             if (method === "saveRouting") {
